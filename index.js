@@ -4,6 +4,10 @@ const mongoose = require('mongoose');
 const moment = require('moment');
 const natural = require('natural');
 const cors = require('cors');
+const path = require('path');
+const { spawn } = require('child_process');
+
+
 const Sentiment = require('sentiment');
 
 const app = express();
@@ -46,13 +50,12 @@ function sanitizeDeviceName(name) {
     return name.replace(/[^a-zA-Z0-9_]/g, '_');
 }
 
-async function connectToDB(dbName, connectorId, additionalInfo = 'hi') {
+async function connectToDB(dbName) {
     try {
         const mongoUrlWithDB = `${mongoUrl}/${dbName}`;
         await mongoose.connect(mongoUrlWithDB, {
             useNewUrlParser: true,
             useUnifiedTopology: true,
-            serverSelectionTimeoutMS: 30000
         });
         console.log(`Connected to MongoDB database: ${dbName}`);
 
@@ -107,7 +110,32 @@ const connectionDetailSchema = new mongoose.Schema({
     timestamps: true, // Adds createdAt and updatedAt fields
 });
 
-
+const reportSchema = new mongoose.Schema({
+    caseNumber: { type: String, required: true },
+    remark: { type: String, required: true },
+    deviceName: { type: String, required: true },
+    sms: {
+      totalMessages: { type: Number, required: true },
+      suspiciousMessages: { type: Number, required: true },
+      fraudMessages: { type: Number, required: true },
+      criminalMessages: { type: Number, required: true },
+      cyberbullyingMessages: { type: Number, required: true },
+      threatMessages: { type: Number, required: true },
+      negativeSentimentMessages: { type: Number, required: true },
+    },
+    calls: {
+      totalCalls: { type: Number, required: true },
+      incomingCalls: { type: Number, required: true },
+      outgoingCalls: { type: Number, required: true },
+      missedCalls: { type: Number, required: true },
+    },
+    contacts: {
+      totalContacts: { type: Number, required: true },
+    },
+    createdAt: { type: Date, default: Date.now },
+  });
+  
+  // Create the model for reports
 
 const timelineAnalysisSchema = new mongoose.Schema({
     date: { type: String, required: true }, // Format: YYYY-MM-DD
@@ -127,7 +155,14 @@ const spamURLAnalysisSchema = new mongoose.Schema({
     body: { type: String, required: true }
 }, { timestamps: true });
 
-
+const fileSchema = new mongoose.Schema({
+    fileName: String,
+    filePath: String,
+    createdAt: { type: Date, default: Date.now }
+  });
+  
+  const File = mongoose.model('File', fileSchema);
+  
   
   // Define the DataCorrelation schema
   const dataCorrelationSchema = new mongoose.Schema({
@@ -143,6 +178,9 @@ const SpamURLAnalysis = mongoose.model('SpamURLAnalysis', spamURLAnalysisSchema)
 
 
 const TimelineAnalysis = mongoose.model('TimelineAnalysis', timelineAnalysisSchema);
+
+const Report = mongoose.model('Report', reportSchema);
+
 
 
 
@@ -305,12 +343,12 @@ app.get('/sms', async (req, res) => {
         await connectToDB(deviceName);
 
         // Fetch received SMS
-        const receivedSmsCommand = 'adb shell content query --uri content://sms/inbox/';
+        const receivedSmsCommand = 'adb shell content query --uri content://sms/inbox';
         const receivedSmsData = await runADBCommand(receivedSmsCommand);
         const parsedReceivedSmsData = parseSMSData(receivedSmsData);
 
         // Fetch sent SMS
-        const sentSmsCommand = 'adb shell content query --uri content://sms/sent/';
+        const sentSmsCommand = 'adb shell content query --uri content://sms/sent';
         const sentSmsData = await runADBCommand(sentSmsCommand);
         const parsedSentSmsData = parseSMSData(sentSmsData);
 
@@ -371,6 +409,86 @@ app.get('/sms', async (req, res) => {
 });
 
 
+
+app.post('/extract', (req, res) => {
+    // Get the directory (optional) from the request body
+    const { directory } = req.body;
+
+    // Define the root directory of the SD card, which will be used to pull all the files
+    const sdCardPath = '/sdcard/';
+
+    // If a directory is provided, append it to the SD card path
+
+    // ADB command to pull the entire SD card data (or specific directory if provided)
+    const adbCommand = `adb pull ${sdCardPath} ./${directory}/`;
+
+    exec(adbCommand, (error, stdout, stderr) => {
+        if (error || stderr) {
+            return res.status(500).send({
+                success: false,
+                message: 'Failed to extract data from SD card',
+                error: error || stderr
+            });
+        }
+
+        // Once the files are pulled, now we save them to the database
+        const extractedDirPath = path.resolve(`./${directory}`);
+
+        // Ensure the extracted folder exists
+        if (!fs.existsSync(extractedDirPath)) {
+            return res.status(500).send({
+                success: false,
+                message: 'No files extracted. Check if the pull command worked.'
+            });
+        }
+
+        // Read the files from the extracted folder and save their info to the database
+        const files = fs.readdirSync(extractedDirPath);
+
+        if (files.length === 0) {
+            return res.status(500).send({
+                success: false,
+                message: 'No files found after extraction.'
+            });
+        }
+
+        // Iterate over each file in the directory
+        const fileSavePromises = files.map(file => {
+            const filePath = path.join(extractedDirPath, file);
+
+            // Only save files (ignore directories)
+            if (fs.statSync(filePath).isFile()) {
+                const newFile = new File({
+                    fileName: file,
+                    filePath: filePath
+                });
+
+                return newFile.save()
+                    .then(() => console.log(`Saved file: ${file}`))
+                    .catch(err => console.log(`Error saving file: ${file}`, err));
+            }
+        });
+
+        // Wait for all files to be saved to the database
+        Promise.all(fileSavePromises)
+            .then(() => {
+                res.send({
+                    success: true,
+                    message: 'Data successfully extracted and saved to database'
+                });
+            })
+            .catch(err => {
+                res.status(500).send({
+                    success: false,
+                    message: 'Error saving files to the database',
+                    error: err
+                });
+            });
+    });
+});
+  
+ 
+
 // Assuming you are using Express and have a model ConnectionDetail
 
 
@@ -386,6 +504,18 @@ app.get('/connection-details', async (req, res) => {
     }
 });
 
+app.get('/whatsapp/chats', async (req, res) => {
+    try {
+        const command = 'adb shell am start -n com.whatsapp/.Main';
+        await runADBCommand(command);
+
+        const getMessagesCommand = 'adb shell content query --uri content://sms'; // Adjust command for WhatsApp
+        const result = await runADBCommand(getMessagesCommand);
+        res.json({ messages: result });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
 function formatDuration(seconds) {
     const minutes = Math.floor(seconds / 60);
@@ -468,14 +598,34 @@ app.get('/call-log', async (req, res) => {
         const deviceName = await getDeviceName();
         await connectToDB(deviceName);
 
-        const callLogCommand = 'adb shell content query --uri content://call_log/calls/';
-        const callLogData = await runADBCommand(callLogCommand);
-        const parsedCallLogData = parseCallLogData(callLogData);
+        const callLogCommand = 'adb';
+        const callLogArgs = ['shell', 'content', 'query', '--uri', 'content://call_log/calls'];
 
-        await CallLog.deleteMany({});
-        await CallLog.insertMany(parsedCallLogData);
+        const adbProcess = spawn(callLogCommand, callLogArgs);
 
-        res.json(parsedCallLogData);
+        let callLogData = '';
+
+        adbProcess.stdout.on('data', (data) => {
+            callLogData += data.toString();
+        });
+
+        adbProcess.stderr.on('data', (data) => {
+            console.error('stderr:', data.toString());
+        });
+
+        adbProcess.on('close', async (code) => {
+            if (code !== 0) {
+                console.error(`adb process exited with code ${code}`);
+                return res.status(500).send('Error querying call log');
+            }
+
+            const parsedCallLogData = parseCallLogData(callLogData);
+
+            await CallLog.deleteMany({});
+            await CallLog.insertMany(parsedCallLogData);
+
+            res.json(parsedCallLogData);
+        });
     } catch (err) {
         console.error('Error querying and saving call log data:', err);
         res.status(500).send('Error querying and saving call log data');
@@ -725,10 +875,159 @@ app.get('/comprehensive-report', async (req, res) => {
 });
 
 
+app.get('/short-report', async (req, res) => {
+    try {
+        // Step 1: Get the device name and sanitize
+        const deviceName = await getDeviceName();
+        const dbName = sanitizeDeviceName(deviceName);
+
+        // Step 2: Connect to the appropriate MongoDB database
+        await connectToDB(dbName);
+
+        // Step 3: Count SMS messages
+        const totalSMSCount = await SMS.countDocuments().exec();
+        const suspiciousSMSCount = await SMS.countDocuments({ isSuspicious: true }).exec();
+        const fraudSMSCount = await SMS.countDocuments({ category: 'fraud' }).exec();
+        const criminalSMSCount = await SMS.countDocuments({ category: 'criminal' }).exec();
+        const cyberbullyingSMSCount = await SMS.countDocuments({ category: 'cyberbullying' }).exec();
+        const threatSMSCount = await SMS.countDocuments({ category: 'threat' }).exec();
+        const negativeSentimentSMSCount = await SMS.countDocuments({ category: 'negative_sentiment' }).exec();
+
+        // Step 4: Count Call logs
+        const totalCallsCount = await CallLog.countDocuments().exec();
+        const incomingCallsCount = await CallLog.countDocuments({ type: 'incoming' }).exec();
+        const outgoingCallsCount = await CallLog.countDocuments({ type: 'outgoing' }).exec();
+        const missedCallsCount = await CallLog.countDocuments({ type: 'missed' }).exec();
+
+        // Step 5: Count Contacts
+        const totalContactsCount = await Contact.countDocuments().exec();
+
+        // Step 6: Fetch the timeline analysis data
+        const timelineData = await TimelineAnalysis.find().exec();
+        if (!timelineData || timelineData.length === 0) {
+            console.warn('No timeline analysis data found.');
+        }
+
+        // Step 7: Fetch Data Correlation
+        const dataCorrelation = await DataCorrelation.find().exec();
+        if (!dataCorrelation || dataCorrelation.length === 0) {
+            console.warn('No data correlation found.');
+        }
+
+      
+
+       
+
+        // Step 10: Create the short report data
+        const reportData = {
+            deviceName,
+            sms: {
+                totalMessages: totalSMSCount,
+                suspiciousMessages: suspiciousSMSCount,
+                fraudMessages: fraudSMSCount,
+                criminalMessages: criminalSMSCount,
+                cyberbullyingMessages: cyberbullyingSMSCount,
+                threatMessages: threatSMSCount,
+                negativeSentimentMessages: negativeSentimentSMSCount,
+            },
+            calls: {
+                totalCalls: totalCallsCount,
+                incomingCalls: incomingCallsCount,
+                outgoingCalls: outgoingCallsCount,
+                missedCalls: missedCallsCount,
+            },
+            contacts: {
+                totalContacts: totalContactsCount,
+            },
+        };
+
+        // Step 11: Send the short report as JSON response
+        res.json(reportData);
+
+    } catch (err) {
+        console.error('Error generating short report:', err);
+        res.status(500).json({ error: 'Failed to generate short report' });
+    }
+});
 
 
 
- 
+
+
+app.post('/short-report', async (req,  res) => {
+    try {
+        const { caseNumber, remark } = req.body;
+
+        // Validate inputs
+        if (!caseNumber || !remark) {
+            return res.status(400).json({ error: 'Case number and remark are required' });
+        }
+
+        // Step 1: Get the device name and sanitize it
+        const deviceName = await getDeviceName();
+        const dbName = sanitizeDeviceName(deviceName);
+
+        // Step 2: Connect to the appropriate MongoDB database
+        await connectToDB(dbName);
+
+        // Step 3: Count SMS messages
+        const totalSMSCount = await SMS.countDocuments().exec();
+        const suspiciousSMSCount = await SMS.countDocuments({ isSuspicious: true }).exec();
+        const fraudSMSCount = await SMS.countDocuments({ category: 'fraud' }).exec();
+        const criminalSMSCount = await SMS.countDocuments({ category: 'criminal' }).exec();
+        const cyberbullyingSMSCount = await SMS.countDocuments({ category: 'cyberbullying' }).exec();
+        const threatSMSCount = await SMS.countDocuments({ category: 'threat' }).exec();
+        const negativeSentimentSMSCount = await SMS.countDocuments({ category: 'negative_sentiment' }).exec();
+
+        // Step 4: Count Call logs
+        const totalCallsCount = await CallLog.countDocuments().exec();
+        const incomingCallsCount = await CallLog.countDocuments({ type: 'incoming' }).exec();
+        const outgoingCallsCount = await CallLog.countDocuments({ type: 'outgoing' }).exec();
+        const missedCallsCount = await CallLog.countDocuments({ type: 'missed' }).exec();
+
+        // Step 5: Count Contacts
+        const totalContactsCount = await Contact.countDocuments().exec();
+
+        // Step 6: Create the short report data
+        const reportData = {
+            caseNumber,
+            remark,
+            deviceName,
+            sms: {
+                totalMessages: totalSMSCount,
+                suspiciousMessages: suspiciousSMSCount,
+                fraudMessages: fraudSMSCount,
+                criminalMessages: criminalSMSCount,
+                cyberbullyingMessages: cyberbullyingSMSCount,
+                threatMessages: threatSMSCount,
+                negativeSentimentMessages: negativeSentimentSMSCount,
+            },
+            calls: {
+                totalCalls: totalCallsCount,
+                incomingCalls: incomingCallsCount,
+                outgoingCalls: outgoingCallsCount,
+                missedCalls: missedCallsCount,
+            },
+            contacts: {
+                totalContacts: totalContactsCount,
+            }
+        };
+
+        // Step 7: Save the report data to the database
+        const newReport = new Report(reportData);
+        await newReport.save();
+
+        // Step 8: Respond with success message and the saved report
+        res.status(201).json({
+            message: 'Report saved successfully',
+            report: newReport
+        });
+
+    } catch (err) {
+        console.error('Error generating short report:', err);
+        res.status(500).json({ error: 'Failed to generate short report' });
+    }
+});
 
 
 app.get('/search', async (req, res) => {
@@ -779,14 +1078,14 @@ app.get('/search', async (req, res) => {
         res.status(500).send('Error searching data');
     }
 });
-
+ 
 app.get('/timeline-analysis', async (req, res) => {
     try {
         const deviceName = await getDeviceName();
         await connectToDB(deviceName);
 
         // Aggregate SMS data
-        const smsTimeline = await SMS.aggregate([
+        const smsData = await SMS.aggregate([
             {
                 $addFields: {
                     date: {
@@ -806,6 +1105,7 @@ app.get('/timeline-analysis', async (req, res) => {
                         month: { $month: "$date" },
                         day: { $dayOfMonth: "$date" }
                     },
+                    details: { $push: { address: "$address", body: "$body", contactName: "$contactName", category: "$category", isSuspicious: "$isSuspicious", sentimentEmoji: "$sentimentEmoji" } },
                     totalMessages: { $sum: 1 },
                     suspiciousMessages: { $sum: { $cond: [{ $eq: ["$isSuspicious", true] }, 1, 0] } }
                 }
@@ -826,7 +1126,8 @@ app.get('/timeline-analysis', async (req, res) => {
                     _id: 0,
                     date: { $dateToString: { format: "%Y-%m-%d", date: "$date" } },
                     totalMessages: 1,
-                    suspiciousMessages: 1
+                    suspiciousMessages: 1,
+                    details: 1
                 }
             },
             {
@@ -835,7 +1136,7 @@ app.get('/timeline-analysis', async (req, res) => {
         ]).exec();
 
         // Aggregate Call Log data
-        const callTimeline = await CallLog.aggregate([
+        const callLogData = await CallLog.aggregate([
             {
                 $addFields: {
                     date: {
@@ -855,8 +1156,9 @@ app.get('/timeline-analysis', async (req, res) => {
                         month: { $month: "$date" },
                         day: { $dayOfMonth: "$date" }
                     },
+                    details: { $push: { number: "$number", type: "$type", duration: "$duration" } },
                     totalCalls: { $sum: 1 },
-                    incomingCalls: { $sum: { $cond: [{ $eq: ["$type", "incoming"] }, 1, 0] } },
+                    incomingCalls: { $sum: { $cond: [{ $eq: ["$type", "received"] }, 1, 0] } },
                     outgoingCalls: { $sum: { $cond: [{ $eq: ["$type", "outgoing"] }, 1, 0] } },
                     missedCalls: { $sum: { $cond: [{ $eq: ["$type", "missed"] }, 1, 0] } }
                 }
@@ -879,7 +1181,8 @@ app.get('/timeline-analysis', async (req, res) => {
                     totalCalls: 1,
                     incomingCalls: 1,
                     outgoingCalls: 1,
-                    missedCalls: 1
+                    missedCalls: 1,
+                    details: 1
                 }
             },
             {
@@ -891,22 +1194,24 @@ app.get('/timeline-analysis', async (req, res) => {
         const combinedTimeline = [];
 
         const allDates = new Set([
-            ...smsTimeline.map(entry => entry.date),
-            ...callTimeline.map(entry => entry.date)
+            ...smsData.map(entry => entry.date),
+            ...callLogData.map(entry => entry.date)
         ]);
 
         allDates.forEach(date => {
-            const smsEntry = smsTimeline.find(entry => entry.date === date) || {};
-            const callEntry = callTimeline.find(entry => entry.date === date) || {};
+            const smsEntry = smsData.find(entry => entry.date === date) || {};
+            const callEntry = callLogData.find(entry => entry.date === date) || {};
 
             combinedTimeline.push({
                 date,
                 totalMessages: smsEntry.totalMessages || 0,
                 suspiciousMessages: smsEntry.suspiciousMessages || 0,
+                smsDetails: smsEntry.details || [],
                 totalCalls: callEntry.totalCalls || 0,
                 incomingCalls: callEntry.incomingCalls || 0,
                 outgoingCalls: callEntry.outgoingCalls || 0,
-                missedCalls: callEntry.missedCalls || 0
+                missedCalls: callEntry.missedCalls || 0,
+                callDetails: callEntry.details || []
             });
         });
 
@@ -917,12 +1222,17 @@ app.get('/timeline-analysis', async (req, res) => {
         await TimelineAnalysis.insertMany(combinedTimeline);
 
         // Send the results in the response
-        res.json(combinedTimeline);
+        res.json({
+            message: "Timeline analysis completed successfully.",
+            timeline: combinedTimeline
+        });
     } catch (err) {
         console.error('Error performing timeline analysis:', err);
         res.status(500).send('Error performing timeline analysis');
     }
 });
+
+
 
 app.get('/url-analysis', async (req, res) => {
     try {
@@ -984,9 +1294,9 @@ app.get('/data-correlation', async (req, res) => {
         const deviceName = await getDeviceName();
         await connectToDB(deviceName);
 
-        // Fetch SMS data
+        // Fetch SMS data from MongoDB
         const smsData = await SMS.aggregate([
-            { $group: { _id: "$address", smsCount: { $sum: 1 }, messages: { $push: "$$ROOT" } } }, // Collect SMS details
+            { $group: { _id: "$address", smsCount: { $sum: 1 }, messages: { $push: "$$ROOT" } } },
             { $sort: { smsCount: -1 } },
         ]);
 
@@ -998,7 +1308,7 @@ app.get('/data-correlation', async (req, res) => {
                     number: sms._id,
                     smsCount: sms.smsCount,
                     messages: sms.messages, // Include SMS details
-                    callLogs
+                    callLogs,
                 };
             } catch (error) {
                 console.error(`Error fetching call logs for number ${sms._id}:`, error);
@@ -1006,7 +1316,7 @@ app.get('/data-correlation', async (req, res) => {
                     number: sms._id,
                     smsCount: sms.smsCount,
                     messages: sms.messages,
-                    callLogs: []
+                    callLogs: [],
                 };
             }
         });
@@ -1025,12 +1335,14 @@ app.get('/data-correlation', async (req, res) => {
         await DataCorrelation.insertMany(validResults);
 
         // Prepare response
-        res.json( validResults );
+        res.json(validResults);
     } catch (err) {
         console.error('Error performing data correlation:', err);
         res.status(500).send('Error performing data correlation');
     }
+
 });
+
 
 
 app.listen(port, async () => {
